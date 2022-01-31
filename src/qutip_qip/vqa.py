@@ -1,3 +1,14 @@
+# TODO
+'''
+I think two blocks sharing the same parameter completely
+breaks a lot of assumptions we made, particularly the derivative.
+And introduces a lot of gross code to make it work.
+
+We should expand the parameterized_hamiltonian class
+to allow one parameter to be shared between two terms
+easily.
+'''
+
 import numpy as np
 from qutip import basis, tensor, Qobj, qeye
 from qutip.qip.circuit import QubitCircuit, Gate, Measurement
@@ -56,6 +67,18 @@ class VQA:
             raise ValueError("Duplicate Block name in self.blocks")
         self.blocks.append(block)
         self.user_gates[block.name] = lambda angle=None: block.get_unitary(angle)
+    def repeat_block(self, block):
+        if not block in self.blocks:
+            raise ValueError("Block cannot be repeated as it was never added")
+        """
+        Add dummy block with same name, and increase the number of times 
+        original block repeats.
+        """
+        self.blocks.append(VQA_Block(
+            block.operator, block.is_unitary, block.name, 
+            block.targets, block.initial, mirror_parameters=block
+            ))
+        block.n_repeats += 1
     def get_free_parameters(self):
         """
         Computes the number of free parameters required
@@ -96,8 +119,11 @@ class VQA:
                 elif block.is_unitary:
                     circ.add_gate(block.name, targets=[k for k in range(self.n_qubits)])
                 else:
-                    circ.add_gate(block.name, arg_value=angles[i], targets=[k for k in range(self.n_qubits)])
-                    i += 1
+                    if block.mirror_parameters is not None:
+                        circ.add_gate(block.name, arg_value=[], targets=[k for k in range(self.n_qubits)])
+                    else:
+                        circ.add_gate(block.name, arg_value=angles[i], targets=[k for k in range(self.n_qubits)])
+                        i += 1
         return circ
     def get_initial_state(self):
         """
@@ -139,7 +165,7 @@ class VQA:
     def optimize_parameters(
             self, initial="random", method="COBYLA", use_jac=False,
             frechet=False, initialization="random", do_nothing=False,
-            layer_by_layer=False):
+            layer_by_layer=False, bounds=None, constraints=None):
 
         self.frechet = frechet
         """
@@ -190,7 +216,9 @@ class VQA:
                 else:
                     layer_jac = None
                 res = minimize(
-                        layer, init, args=(params), method=method, jac=layer_jac
+                        layer, init, args=(params), 
+                        method=method, jac=layer_jac,
+                        bounds=bouds, constraints=constraints
                         )
                 params = np.append(params, res.x)
                 n_params += n_tot - n_params
@@ -201,7 +229,9 @@ class VQA:
                     angles,
                     method=method,
                     jac=jac,
-                    options={'disp': False}
+                    bounds=bounds,
+                    constraints=constraints,
+                    options={'disp': False},
                     )
             angles = res.x
         final_state = self.get_final_state(angles)
@@ -259,9 +289,9 @@ class VQA:
         return np.array(jacobian)
         
     def export_image(self, filename="circuit.png"):
-        circ = self.construct_circuit([1])
+        circ = self.construct_circuit([1 for _ in range(self.get_free_parameters())])
         f = open(filename, 'wb+')
-        f.write(circ.png)
+        f.write(circ.png.data)
         f.close()
         print(f"Image saved to ./{filename}")
 
@@ -305,7 +335,7 @@ class VQA_Block:
     to reference a default qutip_qip.operations gate.
     A "layer" is given by the product of all blocks.
     """
-    def __init__(self, operator, is_unitary=False, name=None, targets=None, initial=False):
+    def __init__(self, operator, is_unitary=False, name=None, targets=None, initial=False, mirror_parameters=None):
         self.operator = operator
         self.is_unitary = is_unitary
         self.name = name
@@ -314,6 +344,10 @@ class VQA_Block:
         self.initial = initial
         self.n_parameters = 0
         self.fixed_parameters = []
+        self.last_parameters = None
+        self.mirror_parameters = mirror_parameters
+        self.n_repeats = 0
+        self.repeat_counter = 0
         if not self.is_unitary and not self.is_native_gate:
             self.n_parameters = 1
         if self.is_native_gate:
@@ -322,6 +356,8 @@ class VQA_Block:
         else:
             if not isinstance(operator, Qobj):
                 raise ValueError("Operator given was neither a gate name nor Qobj")
+        if mirror_parameters is not None:
+            self.n_parameters = 0
     def fix_parameters(angles):
         if len(angles) != self.n_parameters:
             raise ValueError(f"Expected {self.n_parameters} fixed parameters"
@@ -332,13 +368,24 @@ class VQA_Block:
     def get_unitary(self, angle=None):
         if self.is_unitary:
             return self.operator
+
+        if self.repeat_counter:
+            angle = self.last_parameters
+        if self.n_repeats:
+            # repeat counter cycles 0, 1, ..., n_repeats, 0, 1,
+            self.repeat_counter = (self.repeat_counter + 1) % (self.n_repeats+1)
+
+        if self.mirror_parameters is None:
+            self.last_parameters = angle
         else:
-            if self.is_native_gate:
-                raise TypeError("Can't compute unitary of native gate")
-            if angle == None:
-                # TODO: raise better exception?
-                raise TypeError("No parameter given")
-            return (-1j * angle * self.operator).expm()
+            angle = self.mirror_parameters.last_parameters
+
+        if self.is_native_gate:
+            raise ValueError("Can't compute unitary of native gate")
+        if angle == None:
+            raise ValueError("No parameter given")
+        return (-1j * angle * self.operator).expm()
+
     def get_unitary_derivative(self, angle):
         if self.is_unitary or self.is_native_gate:
             raise ValueError("Can only take derivative of block "
