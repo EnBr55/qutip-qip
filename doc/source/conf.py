@@ -57,6 +57,8 @@ extensions = ['sphinx.ext.mathjax',
               'sphinx.ext.viewcode',
               'sphinx.ext.ifconfig',
               'sphinx.ext.napoleon',
+              'sphinxcontrib.bibtex',
+              'sphinx.ext.intersphinx',
 ]
 
 # Add any paths that contain templates here, relative to this directory.
@@ -141,6 +143,8 @@ import numpy as np
 import os
 import warnings
 warnings.filterwarnings("ignore")
+import numpy as np
+np.set_printoptions(precision=5)
 os_nt = {}
 '''.format(os_nt)
 
@@ -170,5 +174,16 @@ napoleon_use_admonition_for_notes = True
 # lots of functions/classes like qutip_qip.operations. However, pay
 # attention that some api docs files are adjusted manually for better illustration
 # and should not be overwritten.
-# autosummary_generate = True
+autosummary_generate = False
 autosummary_imported_members = True
+
+# -- Options for biblatex ---------------------------------------
+
+bibtex_bibfiles = ['references.bib']
+bibtex_default_style = 'unsrt'
+
+# -- Options for intersphinx ---------------------------------------
+
+intersphinx_mapping = {
+    'qutip': ('https://qutip.org/docs/latest/', None),
+}

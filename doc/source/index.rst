@@ -22,6 +22,8 @@ qutip-qip |version|: QuTiP quantum information processing
     qip-basics.rst
     qip-simulator.rst
     qip-processor.rst
+    qip-vqa.rst
+    qip-qiskit.rst
 
 .. toctree::
     :maxdepth: 2
@@ -48,6 +50,11 @@ qutip-qip |version|: QuTiP quantum information processing
     :caption: API documentation
 
     apidoc.rst
+
+.. toctree::
+    :caption: Bibliography
+
+    bibliography.rst
 
 Indices and tables
 ==================

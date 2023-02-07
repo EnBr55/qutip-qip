@@ -17,7 +17,6 @@ from ..circuit import QubitCircuit
 from ..operations import Gate
 from .processor import Processor, Model
 from .modelprocessor import ModelProcessor, _to_array
-from ..operations import expand_operator
 from ..pulse import Pulse
 from ..compiler import GateCompiler, CavityQEDCompiler
 
@@ -28,7 +27,7 @@ __all__ = ["DispersiveCavityQED"]
 class DispersiveCavityQED(ModelProcessor):
     """
     The processor based on the physical implementation of
-    a dispersive cavity QED system.
+    a dispersive cavity QED system (:obj:`.CavityQEDModel`).
     The available Hamiltonian of the system is predefined.
     For a given pulse amplitude matrix, the processor can
     calculate the state evolution under the given control pulse,
@@ -51,15 +50,44 @@ class DispersiveCavityQED(ModelProcessor):
 
     **params:
         Hardware parameters. See :obj:`CavityQEDModel`.
+
+    Examples
+    --------
+
+    .. testcode::
+
+        import numpy as np
+        import qutip
+        from qutip_qip.circuit import QubitCircuit
+        from qutip_qip.device import DispersiveCavityQED
+
+        qc = QubitCircuit(2)
+        qc.add_gate("RX", 0, arg_value=np.pi)
+        qc.add_gate("RY", 1, arg_value=np.pi)
+        qc.add_gate("ISWAP", [1, 0])
+
+        processor = DispersiveCavityQED(2, g=0.1)
+        processor.load_circuit(qc)
+        result = processor.run_state(
+            qutip.basis([10, 2, 2], [0, 0, 0]),
+            options=qutip.Options(nsteps=5000))
+        final_qubit_state = result.states[-1].ptrace([1, 2])
+        print(round(qutip.fidelity(
+            final_qubit_state,
+            qc.run(qutip.basis([2, 2], [0, 0]))
+        ), 4))
+
+    .. testoutput::
+
+        0.9994
+
     """
 
     def __init__(
         self, num_qubits, num_levels=10, correct_global_phase=True, **params
     ):
         model = CavityQEDModel(
-            num_qubits=num_qubits,
-            num_levels=num_levels,
-            **params,
+            num_qubits=num_qubits, num_levels=num_levels, **params
         )
         super(DispersiveCavityQED, self).__init__(
             model=model, correct_global_phase=correct_global_phase
@@ -116,7 +144,14 @@ class DispersiveCavityQED(ModelProcessor):
             [basis(self.num_levels, 0)]
             + [identity(2) for n in range(self.num_qubits)]
         )
-        return psi_proj.dag() * U * psi_proj
+        result = psi_proj.dag() * U * psi_proj
+        # In qutip 5 multiplication of matrices
+        # with dims [[1, 2], [2, 2]] and [[2, 2], [1, 2]]
+        # will give a result of
+        # dims [[1, 2], [1, 2]] instead of [[2], [2]].
+        if result.dims[0][0] == 1:
+            result = result.ptrace(list(range(len(self.dims)))[1:])
+        return result
 
     def load_circuit(self, qc, schedule_mode="ASAP", compiler=None):
         if compiler is None:
@@ -129,27 +164,106 @@ class DispersiveCavityQED(ModelProcessor):
         self.global_phase = compiler.global_phase
         return tlist, coeff
 
+    def generate_init_processor_state(
+        self, init_circuit_state: Qobj = None
+    ) -> Qobj:
+        """
+        Generate the initial state with the dimensions of the :class:`.DispersiveCavityQED` processor.
+
+        Parameters
+        ----------
+        init_circuit_state : :class:`qutip.Qobj`
+            Initial state provided with the dimensions of the circuit.
+
+        Returns
+        -------
+        :class:`qutip.Qobj`
+            Return the initial state with the dimensions of the :class:`.DispersiveCavityQED` processor model.
+            If initial_circuit_state was not provided, return the zero state.
+        """
+        if init_circuit_state is None:
+            return basis(
+                [self.num_levels] + [2] * self.num_qubits,
+                [0] + [0] * self.num_qubits,
+            )
+        return tensor(basis(self.num_levels, 0), init_circuit_state)
+
+    def get_final_circuit_state(self, final_processor_state: Qobj) -> Qobj:
+        """
+        Truncate the final processor state to get rid of the cavity subsystem.
+
+        Parameters
+        ----------
+        final_processor_state : :class:`qutip.Qobj`
+            State provided with the dimensions of the DispersiveCavityQED processor model.
+
+        Returns
+        -------
+        :class:`qutip.Qobj`
+            Return the truncated final state with the dimensions of the circuit.
+        """
+        return final_processor_state.ptrace(
+            range(1, len(final_processor_state.dims[0]))
+        )
+
 
 class CavityQEDModel(Model):
     """
     The physical model for a dispersive cavity-QED processor
     (:obj:`.DispersiveCavityQED`).
+    It is a qubit-resonator model that describes a system composed of
+    a single resonator and a few qubits connected to it.
+    The coupling is kept small so that the resonator is rarely
+    excited but acts only as a mediator for entanglement generation.
+    The single-qubit control Hamiltonians used are
+    :math:`\sigma_x` and :math:`\sigma_z`.
+    The dynamics between the resonator and the qubits is captured by
+    the Tavis-Cummings Hamiltonian,
+    :math:`\propto\sum_j a^\dagger \sigma_j^{-} + a \sigma_j^{+}`,
+    where :math:`a`, :math:`a^\dagger` are
+    the destruction and creation operators of the resonator,
+    while :math:`\sigma_j^{-}`, :math:`\sigma_j^{+}` are those of each qubit.
+    The control of the qubit-resonator coupling depends on
+    the physical implementation, but in the most general case
+    we have single and multi-qubit control in the form
+
+    .. math::
+
+        H=
+        \\sum_{j=0}^{N-1}
+        \\epsilon^{\\rm{max}}_{j}(t) \\sigma^x_{j} +
+        \\Delta^{\\rm{max}}_{j}(t) \\sigma^z_{j} +
+        J_{j}(t)
+        (a^\\dagger \\sigma^{-}_{j} + a \\sigma^{+}_{j}).
+
+    The effective qubit-qubit coupling is computed by the
+
+    .. math::
+
+        J_j = \\frac{g_j g_{j+1}}{2}(\\frac{1}{\\Delta_j} +
+        \\frac{1}{\\Delta_{j+1}}),
+
+    with :math:`\\Delta=w_q-w_0`
+    and the dressed qubit frequency :math:`w_q` defined as
+    :math:`w_q=\sqrt{\epsilon^2+\delta^2}`.
 
     Parameters
     ----------
     num_qubits : int
-        The number of qubits.
+        The number of qubits :math:`N`.
     num_levels : int, optional
         The truncation level of the Hilbert space for the resonator.
     **params :
         Keyword arguments for hardware parameters, in the unit of GHz.
         Qubit parameters can either be a float or a list of the length
-        ``num_qubits``.
+        :math:`N`.
 
         - deltamax: float or list, optional
-            The pulse strength of sigma-x control, default ``1.0``.
+            The pulse strength of sigma-x control,
+            :math:`\\Delta^{\\rm{max}}`, default ``1.0``.
         - epsmax: float or list, optional
-            The pulse strength of sigma-z control, default ``9.5``.
+            The pulse strength of sigma-z control,
+            :math:`\\epsilon^{\\rm{max}}`, default ``9.5``.
         - eps: float or list, optional
             The bare transition frequency for each of the qubits,
             default ``9.5``.
@@ -159,15 +273,13 @@ class CavityQEDModel(Model):
             The coupling strength between the resonator and the qubit,
             default ``1.0``.
         - w0 : float, optional
-            The bare frequency of the resonator. Should only be a float,
-            default ``0.01``.
+            The bare frequency of the resonator :math:`w_0`.
+            Should only be a float, default ``0.01``.
         - t1 : float or list, optional
             Characterize the amplitude damping for each qubit.
         - t2 : list of list, optional
             Characterize the total dephasing for each qubit.
 
-        The dressed qubit frequency is `wq` is computed by
-        :math:`w_q=\sqrt{\epsilon^2+\delta^2}`
     """
 
     def __init__(self, num_qubits, num_levels=10, **params):

@@ -1,6 +1,7 @@
 import pytest
 import numpy as np
 from numpy.testing import assert_array_equal
+from scipy import integrate
 from qutip_qip.compiler.gatecompiler import _default_window_t_max
 
 from qutip_qip.device import (
@@ -39,33 +40,75 @@ def test_compiling_with_scheduler():
     assert(abs(time_scheduled2 * 2 - time_not_scheduled) < 1.0e-10)
 
 
-def gauss_dist(t, sigma, amplitude, duration):
-    return amplitude/np.sqrt(2*np.pi) /sigma*np.exp(-0.5*((t-duration/2)/sigma)**2)
-
-
-def gauss_rx_compiler(gate, args):
+def test_compiling_gates_different_sampling_number():
     """
-    Compiler for the RX gate
+    Define compiler without a physical model.
+    Test compiling gates to pulses with different sampling number.
     """
-    targets = gate.targets  # target qubit
-    parameters = args["params"]
-    h_x2pi = parameters["sx"][targets[0]]  # find the coupling strength for the target qubit
-    amplitude = gate.arg_value / 2. / 0.9973 #  0.9973 is just used to compensate the finite pulse duration so that the total area is fixed
-    gate_sigma = h_x2pi / np.sqrt(2*np.pi)
-    duration = 6 * gate_sigma
-    tlist = np.linspace(0, duration, 100)
-    coeff = gauss_dist(tlist, gate_sigma, amplitude, duration) / np.pi / 2
-    pulse_info = [("sx" + str(targets[0]), coeff)]  #  save the information in a tuple (pulse_name, coeff)
-    return [Instruction(gate, tlist, pulse_info)]
+
+    class MockCompiler(GateCompiler):
+        def __init__(self, num_qubits, params=None):
+            super().__init__(num_qubits, params=params)
+            self.gate_compiler["U1"] = self.single_qubit_gate_compiler
+            self.gate_compiler["U2"] = self.two_qubit_gate_compiler
+            self.args.update({"params": params})
+
+        def single_qubit_gate_compiler(self, gate, args):
+            pulse_info = [("x", np.array([1.0] * 3))]
+            return [
+                Instruction(
+                    gate, tlist=np.linspace(0, 2, 3), pulse_info=pulse_info
+                )
+            ]
+
+        def two_qubit_gate_compiler(self, gate, args):
+            pulse_info = [("xx", np.array([2.0] * 5))]
+            return [
+                Instruction(
+                    gate, tlist=np.linspace(0, 4, 5), pulse_info=pulse_info
+                )
+            ]
+
+    num_qubits = 2
+    circuit = QubitCircuit(num_qubits)
+    circuit.add_gate("U1", targets=0, arg_value=1.0)
+    circuit.add_gate("U2", targets=[0, 1], arg_value=1.0)
+    circuit.add_gate("U1", targets=0, arg_value=1.0)
+
+    compiler = MockCompiler(num_qubits=2)
+    compiled_tlists, compiled_coeffs = compiler.compile(circuit)
+
+    # Filter out the nonzero part of the pulse
+    # and check if they are correct.
+    np.testing.assert_array_equal(
+        compiled_tlists["x"][np.nonzero(compiled_coeffs["x"])[0]],
+        np.array([1, 2, 7, 8]),
+    )
+    np.testing.assert_array_equal(
+        compiled_tlists["xx"][np.nonzero(compiled_coeffs["xx"])[0]],
+        np.array([3, 4, 5, 6]),
+    )
 
 
-from qutip_qip.compiler import GateCompiler
+# Test the compiler with a physical model.
 class MyCompiler(GateCompiler):  # compiler class
     def __init__(self, num_qubits, params):
         super(MyCompiler, self).__init__(num_qubits, params=params)
         # pass our compiler function as a compiler for RX (rotation around X) gate.
-        self.gate_compiler["RX"] = gauss_rx_compiler
+        self.gate_compiler["RX"] = self.rx_compiler
         self.args.update({"params": params})
+
+    def rx_compiler(self, gate, args):
+        targets = gate.targets
+        coeff, tlist = self.generate_pulse_shape(
+            "hann",
+            1000,
+            maximum=args["params"]["sx"][targets[0]],
+            # The operator is Pauli Z/X/Y, without 1/2.
+            area=gate.arg_value / 2.0 / np.pi * 0.5,
+        )
+        pulse_info = [("sx" + str(targets[0]), coeff)]
+        return [Instruction(gate, tlist, pulse_info)]
 
 
 spline_kind = [
@@ -87,11 +130,12 @@ def test_compiler_with_continous_pulse(spline_kind, schedule_mode):
     circuit.add_gate("X", targets=0)
 
     processor = CircularSpinChain(num_qubits)
+    processor.spline_kind = spline_kind
     gauss_compiler = MyCompiler(num_qubits, processor.params)
     processor.load_circuit(
         circuit, schedule_mode = schedule_mode, compiler=gauss_compiler)
     result = processor.run_state(init_state = basis([2,2], [0,0]))
-    assert(abs(fidelity(result.states[-1],basis([2,2],[0,1])) - 1) < 1.e-6)
+    assert(abs(fidelity(result.states[-1],basis([2,2],[0,1])) - 1) < 1.e-5)
 
 
 def rx_compiler_without_pulse_dict(gate, args):
@@ -158,22 +202,11 @@ def test_compiler_result_format():
 
 
 @pytest.mark.parametrize(
-    "shape", list(_default_window_t_max.keys()) + ["rectangular"])
-def test_pulse_shape_scipy(shape):
-    """Test different pulse shape functions imported from scipy"""
-    num_qubits = 1
-    circuit = QubitCircuit(num_qubits)
-    circuit.add_gate("X", 0)
-    processor = LinearSpinChain(num_qubits)
-    compiler = SpinChainCompiler(num_qubits, processor.params)
-    compiler.args.update({"shape": shape, "num_samples": 100})
-    processor.load_circuit(circuit, compiler=compiler)
-    if shape == "rectangular":
-        processor.pulse_mode = "discrete"
-    else:
-        processor.pulse_mode = "continuous"
-    init_state = basis(2, 0)
-    num_result = processor.run_state(init_state).states[-1]
-    ideal_result = circuit.run(init_state)
-    ifid = 1 - fidelity(num_result, ideal_result)
-    assert(pytest.approx(ifid, abs=0.01) == 0)
+    "shape", list(_default_window_t_max.keys()))
+def test_pulse_shape(shape):
+    """Test different pulse shape functions"""
+    coeff, tlist = GateCompiler.generate_pulse_shape(
+        shape, 1001, maximum=1.0, area=1.0)
+    assert pytest.approx(coeff[500], 1.e-2) == 1  # max
+    result = integrate.trapz(coeff, tlist)
+    assert pytest.approx(result, rel=1.e-2) == 1  # area

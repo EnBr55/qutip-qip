@@ -1,9 +1,16 @@
+from copy import deepcopy
+from packaging.version import parse as parse_version
 import pytest
 import functools
 import itertools
 import numpy as np
 import qutip
 from qutip_qip.operations import gates
+from qutip_qip.circuit import QubitCircuit
+from qutip_qip.operations import (
+    X, Y, Z, RX, RY, RZ, H, SQRTNOT, S, T, QASMU, CNOT, CPHASE, ISWAP, SWAP,
+    CZ, SQRTSWAP, SQRTISWAP, SWAPALPHA, SWAPALPHA, MS, TOFFOLI, FREDKIN,
+    BERKELEY, expand_operator)
 
 
 def _permutation_id(permutation):
@@ -15,28 +22,17 @@ def _infidelity(a, b):
     return 1 - abs(a.overlap(b))
 
 
-def _remove_global_phase(qobj):
-    """
-    Return a new Qobj with the gauge fixed for the global phase.  Explicitly,
-    we set the first non-zero element to be purely real-positive.
-    """
-    flat = qobj.full().flat.copy()
-    for phase in flat:
-        if phase != 0:
-            # Fix the gauge for any global phase.
-            flat = flat * np.exp(-1j * np.angle(phase))
-            break
-    return qutip.Qobj(flat.reshape(qobj.shape), dims=qobj.dims)
-
-
 def _make_random_three_qubit_gate():
     """Create a random three-qubit gate."""
-    operation = qutip.rand_unitary(8, dims=[[2]*3]*2)
+    if parse_version(qutip.__version__) < parse_version('5.dev'):
+        operation = qutip.rand_unitary(8, dims=[[2] * 3] * 2)
+    else:
+        operation = qutip.rand_unitary([2] * 3)
 
     def gate(N=None, controls=None, target=None):
         if N is None:
             return operation
-        return gates.gate_expand_3toN(operation, N, controls, target)
+        return expand_operator(operation, dims=[2]*N, targets=controls + [target])
     return gate
 
 
@@ -108,9 +104,8 @@ class TestExplicitForm:
                              tuple(itertools.permutations([0, 1, 2])),
                              ids=_permutation_id)
     def test_toffoli(self, permutation):
-        test = gates.toffoli(N=3,
-                             controls=permutation[:2],
-                             target=permutation[2])
+        test = expand_operator(
+            gates.toffoli(), dims=[2] * 3, targets=permutation)
         base = (qutip.tensor(1 - qutip.basis([2, 2], [1, 1]).proj(),
                              qutip.qeye(2))
                 + qutip.tensor(qutip.basis([2, 2], [1, 1]).proj(),
@@ -139,8 +134,8 @@ class TestExplicitForm:
         pytest.param(gates.qrot, 2, id="Rabi rotation"),
     ])
     def test_zero_rotations_are_identity(self, gate, n_angles):
-        np.testing.assert_allclose(np.eye(2), gate(*([0]*n_angles)),
-                                   atol=1e-15)
+        np.testing.assert_allclose(
+            np.eye(2), gate(*([0]*n_angles)).full(), atol=1e-15)
 
 
 class TestCliffordGroup:
@@ -155,11 +150,12 @@ class TestCliffordGroup:
         assert len(self.clifford) == 24
 
     def test_all_elements_different(self):
-        clifford = [_remove_global_phase(gate) for gate in self.clifford]
+        clifford = [gate for gate in self.clifford]
         for i, gate in enumerate(clifford):
             for other in clifford[i+1:]:
                 # Big tolerance because we actually want to test the inverse.
-                assert not np.allclose(gate.full(), other.full(), atol=1e-3)
+                fid = qutip.average_gate_fidelity(gate, other)
+                assert not np.allclose(fid, 1., atol=1e-3)
 
     @pytest.mark.parametrize("gate", gates.qubit_clifford_group())
     def test_gate_normalises_pauli_group(self, gate):
@@ -170,17 +166,18 @@ class TestCliffordGroup:
         # Assert that each Clifford gate maps the set of Pauli gates back onto
         # itself (though not necessarily in order).  This condition is no
         # stronger than simply considering each (gate, Pauli) pair separately.
-        pauli_gates = [_remove_global_phase(x) for x in self.pauli]
-        normalised = [_remove_global_phase(gate * pauli * gate.dag())
-                      for pauli in self.pauli]
+        pauli_gates = deepcopy(self.pauli)
+        normalised = [gate * pauli * gate.dag() for pauli in self.pauli]
         for gate in normalised:
             for i, pauli in enumerate(pauli_gates):
-                if np.allclose(gate.full(), pauli.full(), atol=1e-10):
+                # if np.allclose(gate.full(), pauli.full(), atol=1e-10):
+                if np.allclose(qutip.average_gate_fidelity(gate, pauli), 1):
                     del pauli_gates[i]
                     break
         assert len(pauli_gates) == 0
 
 
+@pytest.mark.filterwarnings('ignore::DeprecationWarning')
 class TestGateExpansion:
     """
     Test that gates act correctly when supplied with controls and targets, i.e.
@@ -270,8 +267,10 @@ class Test_expand_operator:
         ids=_permutation_id)
     def test_permutation_without_expansion(self, permutation):
         base = qutip.tensor([qutip.rand_unitary(2) for _ in permutation])
-        test = gates.expand_operator(base,
-                                     N=len(permutation), targets=permutation)
+        test = gates.expand_operator(
+            base,
+            dims=[2] * len(permutation),
+            targets=permutation)
         expected = base.permute(_apply_permutation(permutation))
         np.testing.assert_allclose(test.full(), expected.full(), atol=1e-15)
 
@@ -279,16 +278,21 @@ class Test_expand_operator:
     def test_general_qubit_expansion(self, n_targets):
         # Test all permutations with the given number of targets.
         n_qubits = 5
-        operation = qutip.rand_unitary(2**n_targets, dims=[[2]*n_targets]*2)
+        if parse_version(qutip.__version__) < parse_version('5.dev'):
+            operation = qutip.rand_unitary(2**n_targets, dims=[[2]*n_targets]*2)
+        else:
+            operation = qutip.rand_unitary([2]*n_targets)
         for targets in itertools.permutations(range(n_qubits), n_targets):
             expected = _tensor_with_entanglement([qutip.qeye(2)] * n_qubits,
                                                  operation, targets)
-            test = gates.expand_operator(operation, n_qubits, targets)
+            test = gates.expand_operator(
+                operation, dims=[2] * n_qubits, targets=targets)
             np.testing.assert_allclose(test.full(), expected.full(),
                                        atol=1e-15)
 
     def test_cnot_explicit(self):
-        test = gates.expand_operator(gates.cnot(), 3, [2, 0]).full()
+        test = gates.expand_operator(
+            gates.cnot(), dims=[2] * 3, targets=[2, 0]).full()
         expected = np.array([[1, 0, 0, 0, 0, 0, 0, 0],
                              [0, 0, 0, 0, 0, 1, 0, 0],
                              [0, 0, 1, 0, 0, 0, 0, 0],
@@ -316,17 +320,6 @@ class Test_expand_operator:
         expected = expected / np.sqrt(8)
         np.testing.assert_allclose(test, expected)
 
-    def test_cyclic_permutation(self):
-        operators = [qutip.sigmax(), qutip.sigmaz()]
-        test = gates.expand_operator(qutip.tensor(*operators), N=3,
-                                     targets=[0, 1], cyclic_permutation=True)
-        base_expected = qutip.tensor(*operators, qutip.qeye(2))
-        expected = [base_expected.permute(x)
-                    for x in [[0, 1, 2], [1, 2, 0], [2, 0, 1]]]
-        assert len(expected) == len(test)
-        for element in expected:
-            assert element in test
-
     @pytest.mark.parametrize('dimensions', [
         pytest.param([3, 4, 5], id="standard"),
         pytest.param([3, 3, 4, 4, 2], id="standard"),
@@ -340,7 +333,67 @@ class Test_expand_operator:
                          for n, dimension in enumerate(dimensions)]
             expected = qutip.tensor(*operators)
             base_test = qutip.tensor(*[operators[x] for x in targets])
-            test = gates.expand_operator(base_test, N=n_qubits,
-                                         targets=targets, dims=dimensions)
+            test = gates.expand_operator(base_test, dims=dimensions,
+                                         targets=targets)
             assert test.dims == expected.dims
             np.testing.assert_allclose(test.full(), expected.full())
+
+def test_gates_class():
+    if parse_version(qutip.__version__) < parse_version('5.dev'):
+        init_state = qutip.rand_ket(8, dims=[[2, 2, 2], [1, 1, 1]])
+    else:
+        init_state = qutip.rand_ket([2, 2, 2])
+
+    circuit1 = QubitCircuit(3)
+    circuit1.add_gate("X", 1)
+    circuit1.add_gate("Y", 1)
+    circuit1.add_gate("Z", 2)
+    circuit1.add_gate("RX", 0, arg_value=np.pi/4)
+    circuit1.add_gate("RY", 0, arg_value=np.pi/4)
+    circuit1.add_gate("RZ", 1, arg_value=np.pi/4)
+    circuit1.add_gate("H", 0)
+    circuit1.add_gate("SQRTNOT", 0)
+    circuit1.add_gate("S", 2)
+    circuit1.add_gate("T", 1)
+    circuit1.add_gate("QASMU", 0, arg_value=(np.pi/4, np.pi/4, np.pi/4))
+    circuit1.add_gate("CNOT", controls=0, targets=1)
+    circuit1.add_gate("CPHASE", controls=0, targets=1, arg_value=np.pi/4)
+    circuit1.add_gate("SWAP", [0, 1])
+    circuit1.add_gate("ISWAP", [2, 1])
+    circuit1.add_gate("CZ", controls=0, targets=2)
+    circuit1.add_gate("SQRTSWAP", [2, 0])
+    circuit1.add_gate("SQRTISWAP", [0, 1])
+    circuit1.add_gate("SWAPALPHA", [1, 2], arg_value=np.pi/4)
+    circuit1.add_gate("MS", [1, 0], arg_value=np.pi/4)
+    circuit1.add_gate("TOFFOLI", [2, 0, 1])
+    circuit1.add_gate("FREDKIN", [0, 1, 2])
+    circuit1.add_gate("BERKELEY", [1, 0])
+    result1 = circuit1.run(init_state)
+
+    circuit2 = QubitCircuit(3)
+    circuit2.add_gate(X(1))
+    circuit2.add_gate(Y(1))
+    circuit2.add_gate(Z(2))
+    circuit2.add_gate(RX(0, np.pi/4))
+    circuit2.add_gate(RY(0, np.pi/4))
+    circuit2.add_gate(RZ(1, np.pi/4))
+    circuit2.add_gate(H(0))
+    circuit2.add_gate(SQRTNOT(0))
+    circuit2.add_gate(S(2))
+    circuit2.add_gate(T(1))
+    circuit2.add_gate(QASMU(0, (np.pi/4, np.pi/4, np.pi/4)))
+    circuit2.add_gate(CNOT(0, 1))
+    circuit2.add_gate(CPHASE(0, 1, np.pi/4))
+    circuit2.add_gate(SWAP([0, 1]))
+    circuit2.add_gate(ISWAP([2, 1]))
+    circuit2.add_gate(CZ(0, 2))
+    circuit2.add_gate(SQRTSWAP([2, 0]))
+    circuit2.add_gate(SQRTISWAP([0, 1]))
+    circuit2.add_gate(SWAPALPHA([1, 2], np.pi/4))
+    circuit2.add_gate(MS([1, 0], np.pi/4))
+    circuit2.add_gate(TOFFOLI([2, 0, 1]))
+    circuit2.add_gate(FREDKIN([0, 1, 2]))
+    circuit2.add_gate(BERKELEY([1, 0]))
+    result2 = circuit2.run(init_state)
+
+    assert pytest.approx(qutip.fidelity(result1, result2), 1.0e-6) == 1
