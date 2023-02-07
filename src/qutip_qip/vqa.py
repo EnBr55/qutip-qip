@@ -258,6 +258,8 @@ class VQA:
         layer_by_layer=False,
         bounds=None,
         constraints=(),
+        maxiter=None,
+        tol=None,
     ):
         """
         Run VQA optimization loop
@@ -357,6 +359,8 @@ class VQA:
                     jac=layer_jac,
                     bounds=bounds,
                     constraints=constraints,
+                    tol=tol,
+                    options={"maxiter": maxiter},
                 )
                 params = np.append(params, res.x)
                 n_params += n_tot - n_params
@@ -369,7 +373,8 @@ class VQA:
                 jac=self.compute_jac if use_jac else None,
                 bounds=bounds,
                 constraints=constraints,
-                options={"disp": False},
+                tol=tol,
+                options={"disp": False, "maxiter": maxiter},
             )
             angles = res.x
         final_state = self.get_final_state(angles)
